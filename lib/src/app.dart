@@ -23,6 +23,8 @@ import 'static/main.dart.js.dart' as main_dart_js;
 part 'app.g.dart';
 
 class App {
+  static const proxyOriginHeader = "proxy-origin";
+
   /// meta information store
   final MetaStore metaStore;
 
@@ -35,6 +37,9 @@ class App {
   /// http(s) proxy to call googleapis (to get uploader email)
   final String? googleapisProxy;
   final String? overrideUploaderEmail;
+
+  /// A forward proxy uri
+  final Uri? proxy_origin;
 
   /// validate if the package can be published
   ///
@@ -49,6 +54,7 @@ class App {
     this.googleapisProxy,
     this.overrideUploaderEmail,
     this.uploadValidator,
+    this.proxy_origin,
   });
 
   static shelf.Response _okWithJson(Map<String, dynamic> data) =>
@@ -76,6 +82,17 @@ class App {
 
   http.Client? _googleapisClient;
 
+  String _resolveUrl(shelf.Request req, String reference) {
+    if (proxy_origin != null) {
+      return proxy_origin!.resolve(reference).toString();
+    }
+    String? proxyOriginInHeader = req.headers[proxyOriginHeader];
+    if (proxyOriginInHeader != null) {
+      return Uri.parse(proxyOriginInHeader).resolve(reference).toString();
+    }
+    return req.requestedUri.resolve(reference).toString();
+  }
+
   Future<String> _getUploaderEmail(shelf.Request req) async {
     if (overrideUploaderEmail != null) return overrideUploaderEmail!;
 
@@ -100,7 +117,7 @@ class App {
     return info.email!;
   }
 
-  Future<HttpServer> serve([String? host = '0.0.0.0', int port = 4000]) async {
+  Future<HttpServer> serve([String host = '0.0.0.0', int port = 4000]) async {
     var handler = const shelf.Pipeline()
         .addMiddleware(corsHeaders())
         .addMiddleware(shelf.logRequests())
@@ -110,18 +127,15 @@ class App {
       var res = await router.call(req);
       return res;
     });
-    final hosts = host ?? '';
-    var server = await shelf_io.serve(handler, hosts, port);
+    var server = await shelf_io.serve(handler, host, port);
     return server;
   }
 
-  Map<String, dynamic> _versionToJson(UnpubVersion item, Uri baseUri) {
+  Map<String, dynamic> _versionToJson(UnpubVersion item, shelf.Request req) {
     var name = item.pubspec['name'] as String;
     var version = item.version;
     return {
-      'archive_url': baseUri
-          .resolve('/packages/$name/versions/$version.tar.gz')
-          .toString(),
+      'archive_url': _resolveUrl(req, '/packages/$name/versions/$version.tar.gz'),
       'pubspec': item.pubspec,
       'version': version,
     };
@@ -150,7 +164,7 @@ class App {
     });
 
     var versionMaps = package.versions
-        .map((item) => _versionToJson(item, req.requestedUri))
+        .map((item) => _versionToJson(item, req))
         .toList();
 
     return _okWithJson({
@@ -183,7 +197,7 @@ class App {
       return shelf.Response.notFound('Not Found');
     }
 
-    return _okWithJson(_versionToJson(packageVersion, req.requestedUri));
+    return _okWithJson(_versionToJson(packageVersion, req));
   }
 
   @Route.get('/packages/<name>/versions/<version>.tar.gz')
@@ -201,7 +215,8 @@ class App {
     }
 
     if (packageStore.supportsDownloadUrl) {
-      return shelf.Response.found(packageStore.downloadUrl(name, version));
+      return shelf.Response.found(
+          await packageStore.downloadUrl(name, version));
     } else {
       return shelf.Response.ok(
         packageStore.download(name, version),
@@ -213,8 +228,7 @@ class App {
   @Route.get('/api/packages/versions/new')
   Future<shelf.Response> getUploadUrl(shelf.Request req) async {
     return _okWithJson({
-      'url': req.requestedUri
-          .resolve('/api/packages/versions/newUpload')
+      'url': _resolveUrl(req, '/api/packages/versions/newUpload')
           .toString(),
       'fields': {},
     });
@@ -223,7 +237,7 @@ class App {
   @Route.post('/api/packages/versions/newUpload')
   Future<shelf.Response> upload(shelf.Request req) async {
     try {
-      var uploader = '';//await _getUploaderEmail(req);
+      var uploader = await _getUploaderEmail(req);
 
       var contentType = req.headers['content-type'];
       if (contentType == null) throw 'invalid content type';
@@ -286,12 +300,12 @@ class App {
 
       // Package already exists
       if (package != null) {
-        if (package.private != true) {
+        if (package.private == false) {
           throw '$name is not a private package. Please upload it to https://pub.dev';
         }
 
         // Check uploaders
-        if (!package.uploaders.contains(uploader)) {
+        if (package.uploaders?.contains(uploader) == false) {
           throw '$uploader is not an uploader of $name';
         }
 
@@ -328,12 +342,9 @@ class App {
       await metaStore.addVersion(name, unpubVersion);
 
       // TODO: Upload docs
-      return shelf.Response.found(req.requestedUri
-          .resolve('/api/packages/versions/newUploadFinish')
-          .toString());
+      return shelf.Response.found(_resolveUrl(req, '/api/packages/versions/newUploadFinish'));
     } catch (err) {
-      return shelf.Response.found(req.requestedUri
-          .resolve('/api/packages/versions/newUploadFinish?error=$err'));
+      return shelf.Response.found(_resolveUrl(req, '/api/packages/versions/newUploadFinish?error=$err'));
     }
   }
 
@@ -350,15 +361,15 @@ class App {
   Future<shelf.Response> addUploader(shelf.Request req, String name) async {
     var body = await req.readAsString();
     var email = Uri.splitQueryString(body)['email']!; // TODO: null
-    // var operatorEmail = await _getUploaderEmail(req);
-    // var package = await metaStore.queryPackage(name);
-    //
-    // if (package?.uploaders.contains(operatorEmail) != true) {
-    //   return _badRequest('no permission', status: HttpStatus.forbidden);
-    // }
-    // if (package?.uploaders.contains(email) == true) {
-    //   return _badRequest('email already exists');
-    // }
+    var operatorEmail = await _getUploaderEmail(req);
+    var package = await metaStore.queryPackage(name);
+
+    if (package?.uploaders?.contains(operatorEmail) == false) {
+      return _badRequest('no permission', status: HttpStatus.forbidden);
+    }
+    if (package?.uploaders?.contains(email) == true) {
+      return _badRequest('email already exists');
+    }
 
     await metaStore.addUploader(name, email);
     return _successMessage('uploader added');
@@ -368,16 +379,16 @@ class App {
   Future<shelf.Response> removeUploader(
       shelf.Request req, String name, String email) async {
     email = Uri.decodeComponent(email);
-    // var operatorEmail = await _getUploaderEmail(req);
-    // var package = await metaStore.queryPackage(name);
-    //
-    // // TODO: null
-    // if (!package!.uploaders.contains(operatorEmail)) {
-    //   return _badRequest('no permission', status: HttpStatus.forbidden);
-    // }
-    // if (!package.uploaders.contains(email)) {
-    //   return _badRequest('email not uploader');
-    // }
+    var operatorEmail = await _getUploaderEmail(req);
+    var package = await metaStore.queryPackage(name);
+
+    // TODO: null
+    if (package?.uploaders?.contains(operatorEmail) == false) {
+      return _badRequest('no permission', status: HttpStatus.forbidden);
+    }
+    if (package?.uploaders?.contains(email) == false) {
+      return _badRequest('email not uploader');
+    }
 
     await metaStore.removeUploader(name, email);
     return _successMessage('uploader removed');
@@ -425,6 +436,26 @@ class App {
     ]);
 
     return _okWithJson({'data': data.toJson()});
+  }
+
+  @Route.get('/packages/<name>.json')
+  Future<shelf.Response> getPackageVersions(
+      shelf.Request req, String name) async {
+    var package = await metaStore.queryPackage(name);
+    if (package == null) {
+      return _badRequest('package not exists', status: HttpStatus.notFound);
+    }
+
+    var versions = package.versions.map((v) => v.version).toList();
+    versions.sort((a, b) {
+      return semver.Version.prioritize(
+          semver.Version.parse(b), semver.Version.parse(a));
+    });
+
+    return _okWithJson({
+      'name': name,
+      'versions': versions,
+    });
   }
 
   @Route.get('/webapi/package/<name>/<version>')
@@ -476,7 +507,7 @@ class App {
       packageVersion.version,
       packageVersion.pubspec['description'] ?? '',
       packageVersion.pubspec['homepage'] ?? '',
-      package.uploaders,
+      package.uploaders ?? [],
       packageVersion.createdAt,
       packageVersion.readme,
       packageVersion.changelog,
